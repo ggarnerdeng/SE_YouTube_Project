@@ -1,0 +1,25 @@
+{
+  "hours": 72,
+  "limit": 12,
+  "min_trends_matches": 5,
+
+  "geo": "US",
+  "user_agent": "TrendFetcher/1.0",
+  "timeout_s": 15,
+
+  "keywords_file": "keywords.txt",
+
+  "enable_trends": true,
+  "enable_news_backfill": true,
+  "debug": true,
+
+  "fallback_mode": "fallback_to_news_unfiltered",
+  "fallback_limit": 12,
+
+  "news": {
+    "query": "Trump OR Biden OR Harris OR \"White House\" OR Congress OR Senate OR DOJ OR FBI OR \"Supreme Court\" OR election OR Iran OR Israel OR Gaza OR Ukraine OR Russia OR China",
+    "hl": "en-US",
+    "gl": "US",
+    "ceid": "US:en"
+  }
+}
