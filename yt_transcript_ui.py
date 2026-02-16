@@ -8,10 +8,11 @@ Features:
 - Adds timestamps to each line [mm:ss]
 - Fetches metadata (title, description, channel/author, publish date, duration, view count, tags, etc.)
   via yt-dlp (no API key required)
+- Best-effort: fetch top comments via yt-dlp (no API key required; may be brittle)
 - Shows everything in the UI and lets you Save As .txt
 
 Install:
-  pip install youtube-transcript-api yt-dlp
+  python -m pip install youtube-transcript-api yt-dlp
 
 Run:
   python yt_transcript_ui.py
@@ -25,11 +26,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from youtube_transcript_api import YouTubeTranscriptApi
-
-# yt-dlp gives reliable metadata without needing a YouTube API key
-# (it may occasionally need updates if YouTube changes things)
 from yt_dlp import YoutubeDL
-
 
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 
@@ -39,7 +36,7 @@ def extract_video_id(url_or_id: str) -> str:
     if not s:
         raise ValueError("Please paste a YouTube URL (or a video id).")
 
-    # user pasted just the 11-char ID
+    # If user pasted just the 11-char ID
     if VIDEO_ID_RE.fullmatch(s):
         return s
 
@@ -58,7 +55,7 @@ def extract_video_id(url_or_id: str) -> str:
     raise ValueError("Could not extract a video id from that input.")
 
 
-def format_mmss(seconds: float) -> str:
+def format_mmss(seconds: float | None) -> str:
     if seconds is None:
         return "00:00"
     total = int(round(float(seconds)))
@@ -80,10 +77,7 @@ def fetch_transcript_segments(video_id: str, lang: str | None = None):
 
 
 def segments_to_timestamped_text(segments) -> str:
-    """
-    Convert snippets to "[mm:ss] text" lines.
-    Works with v1.x snippet objects.
-    """
+    """Convert snippets to "[mm:ss] text" lines (v1.x snippet objects)."""
     lines: list[str] = []
     for seg in segments:
         text = (getattr(seg, "text", "") or "").replace("\n", " ").strip()
@@ -93,10 +87,10 @@ def segments_to_timestamped_text(segments) -> str:
     return "\n".join(lines)
 
 
-def fetch_video_metadata(video_id: str) -> dict:
+def fetch_video_metadata(video_id: str, max_comments: int = 30) -> dict:
     """
-    Use yt-dlp to fetch metadata without a YouTube API key.
-    Returns a dict with common fields.
+    Use yt-dlp to fetch metadata + (optionally) top comments without a YouTube API key.
+    NOTE: comment scraping can be brittle and may fail depending on yt-dlp version / YouTube changes.
     """
     url = f"https://www.youtube.com/watch?v={video_id}"
 
@@ -104,14 +98,37 @@ def fetch_video_metadata(video_id: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        # Reduce noise; we only want info
         "extract_flat": False,
+
+        # Enable comment extraction (best effort)
+        "getcomments": True,
+
+        # Ask for top comments and cap count (support depends on yt-dlp version)
+        "extractor_args": {
+            "youtube": {
+                "max_comments": [str(max_comments)],
+                "comment_sort": ["top"],
+            }
+        },
     }
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
-    # Normalize / cherry-pick the most useful fields for downstream ChatGPT context
+    comments_raw = info.get("comments") or []
+    comments = []
+    for c in comments_raw:
+        if not isinstance(c, dict):
+            continue
+        text = (c.get("text") or c.get("content") or "").strip()
+        if not text:
+            continue
+        comments.append({
+            "author": c.get("author"),
+            "text": text,
+            "like_count": c.get("like_count"),
+        })
+
     meta = {
         "webpage_url": info.get("webpage_url") or url,
         "title": info.get("title"),
@@ -128,14 +145,14 @@ def fetch_video_metadata(video_id: str) -> dict:
         "tags": info.get("tags") or [],
         "categories": info.get("categories") or [],
         "language": info.get("language"),
+        "top_comments": comments,
     }
     return meta
 
 
 def format_metadata_block(meta: dict) -> str:
-    """
-    Create a human-readable header block to save with transcript.
-    """
+    """Create a ChatGPT-friendly header block to save with transcript."""
+
     def fmt_int(x):
         return f"{x:,}" if isinstance(x, int) else (str(x) if x is not None else "")
 
@@ -150,8 +167,7 @@ def format_metadata_block(meta: dict) -> str:
     tags = meta.get("tags") or []
     cats = meta.get("categories") or []
 
-    # Keep this block “ChatGPT-friendly”: easy to parse, strong context up top
-    lines = [
+    lines: list[str] = [
         "=== VIDEO METADATA ===",
         f"URL: {meta.get('webpage_url', '')}",
         f"Title: {meta.get('title', '')}",
@@ -171,15 +187,33 @@ def format_metadata_block(meta: dict) -> str:
         "=== VIDEO DESCRIPTION ===",
         (meta.get("description") or "").strip(),
         "",
+        "=== TOP COMMENTS ===",
+    ]
+
+    top_comments = meta.get("top_comments") or []
+    if not top_comments:
+        lines.append("(No comments fetched.)")
+    else:
+        for i, c in enumerate(top_comments, start=1):
+            author = c.get("author") or "Unknown"
+            likes = c.get("like_count")
+            likes_str = f"{likes:,}" if isinstance(likes, int) else ""
+            text = (c.get("text") or "").replace("\n", " ").strip()
+            # Keep it one-line per comment for easy LLM parsing
+            lines.append(f"{i}. {author} ({likes_str} likes): {text}")
+
+    lines += [
+        "",
         "=== TRANSCRIPT (TIMESTAMPED) ===",
     ]
+
     return "\n".join(lines).rstrip() + "\n"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("YouTube Transcript Extractor (with Metadata + Timestamps)")
+        self.title("YouTube Transcript Extractor (Metadata + Comments + Timestamps)")
         self.geometry("980x720")
         self.minsize(780, 560)
 
@@ -203,9 +237,12 @@ class App(tk.Tk):
         url_entry.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 0))
         url_entry.focus()
 
-        ttk.Label(top, text="Language (optional, e.g. en). Clear to auto:").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        lang_entry = ttk.Entry(top, textvariable=self.lang_var, width=10)
-        lang_entry.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="Language (optional, e.g. en). Clear to auto:").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Entry(top, textvariable=self.lang_var, width=10).grid(
+            row=3, column=0, sticky="w", pady=(4, 0)
+        )
 
         self.fetch_btn = ttk.Button(top, text="Fetch", command=self.on_fetch)
         self.fetch_btn.grid(row=3, column=1, sticky="w", padx=(10, 0))
@@ -219,8 +256,7 @@ class App(tk.Tk):
         self.clear_btn = ttk.Button(top, text="Clear", command=self.on_clear)
         self.clear_btn.grid(row=3, column=4, sticky="w", padx=(10, 0))
 
-        status_bar = ttk.Label(self, textvariable=self.status, anchor="w")
-        status_bar.pack(fill="x", padx=pad, pady=(8, 0))
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=pad, pady=(8, 0))
 
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=pad, pady=pad)
@@ -232,14 +268,14 @@ class App(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.text.configure(yscrollcommand=scroll.set)
 
+    def _has_content(self) -> bool:
+        return bool(self.text.get("1.0", "end-1c").strip())
+
     def set_busy(self, busy: bool):
         self.fetch_btn.configure(state=("disabled" if busy else "normal"))
         self.clear_btn.configure(state=("disabled" if busy else "normal"))
         self.copy_btn.configure(state=("disabled" if busy else ("normal" if self._has_content() else "disabled")))
         self.save_btn.configure(state=("disabled" if busy else ("normal" if self._has_content() else "disabled")))
-
-    def _has_content(self) -> bool:
-        return bool(self.text.get("1.0", "end-1c").strip())
 
     def on_clear(self):
         self.text.delete("1.0", "end")
@@ -267,14 +303,12 @@ class App(tk.Tk):
             return
 
         self.set_busy(True)
-        self.status.set("Fetching metadata + transcript…")
+        self.status.set("Fetching metadata, comments, and transcript…")
 
         def worker():
             try:
-                # 1) metadata (helps interpret transcript later)
                 meta = fetch_video_metadata(video_id)
 
-                # 2) transcript segments -> timestamped text
                 segments = fetch_transcript_segments(video_id, lang=lang)
                 transcript_text = segments_to_timestamped_text(segments)
 
@@ -314,7 +348,6 @@ class App(tk.Tk):
             messagebox.showinfo("Nothing to save", "The output box is empty.")
             return
 
-        # Suggest a filename based on title if we have it
         initial = "transcript.txt"
         if self.current_meta and self.current_meta.get("title"):
             safe = re.sub(r"[\\/:*?\"<>|]+", "", self.current_meta["title"]).strip()
@@ -345,5 +378,4 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    app = App()
-    app.mainloop()
+    App().mainloop()
