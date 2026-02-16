@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+YouTube Transcript Extractor (UI)
+
+Features:
+- Paste a YouTube URL (watch/shorts/youtu.be/live/embed) or 11-char video id
+- Fetch transcript via youtube-transcript-api (works with v1.x like 1.2.4)
+- Adds timestamps to each line [mm:ss]
+- Fetches metadata (title, description, channel/author, publish date, duration, view count, tags, etc.)
+  via yt-dlp (no API key required)
+- Shows everything in the UI and lets you Save As .txt
+
+Install:
+  pip install youtube-transcript-api yt-dlp
+
+Run:
+  python yt_transcript_ui.py
+"""
+
 from __future__ import annotations
 
 import re
@@ -7,6 +25,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from youtube_transcript_api import YouTubeTranscriptApi
+
+# yt-dlp gives reliable metadata without needing a YouTube API key
+# (it may occasionally need updates if YouTube changes things)
+from yt_dlp import YoutubeDL
 
 
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
@@ -17,11 +39,10 @@ def extract_video_id(url_or_id: str) -> str:
     if not s:
         raise ValueError("Please paste a YouTube URL (or a video id).")
 
-    # If user pasted just the 11-char ID
+    # user pasted just the 11-char ID
     if VIDEO_ID_RE.fullmatch(s):
         return s
 
-    # Common URL patterns
     patterns = [
         r"(?:v=)([A-Za-z0-9_-]{11})",                 # watch?v=ID
         r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",         # youtu.be/ID
@@ -37,33 +58,136 @@ def extract_video_id(url_or_id: str) -> str:
     raise ValueError("Could not extract a video id from that input.")
 
 
-def fetch_transcript_text(video_id: str, lang: str | None = None) -> str:
+def format_mmss(seconds: float) -> str:
+    if seconds is None:
+        return "00:00"
+    total = int(round(float(seconds)))
+    mm = total // 60
+    ss = total % 60
+    return f"{mm:02d}:{ss:02d}"
+
+
+def fetch_transcript_segments(video_id: str, lang: str | None = None):
+    """
+    youtube-transcript-api v1.x:
+      api = YouTubeTranscriptApi()
+      api.fetch(video_id, languages=[...]) -> list of snippet objects (with .text, .start, .duration)
+    """
     api = YouTubeTranscriptApi()
-
-    # v1.x returns a list of objects with .text
     if lang:
-        segments = api.fetch(video_id, languages=[lang])
-    else:
-        segments = api.fetch(video_id)
+        return api.fetch(video_id, languages=[lang])
+    return api.fetch(video_id)
 
-    lines = []
+
+def segments_to_timestamped_text(segments) -> str:
+    """
+    Convert snippets to "[mm:ss] text" lines.
+    Works with v1.x snippet objects.
+    """
+    lines: list[str] = []
     for seg in segments:
-        txt = (getattr(seg, "text", "") or "").replace("\n", " ").strip()
-        if txt:
-            lines.append(txt)
-
+        text = (getattr(seg, "text", "") or "").replace("\n", " ").strip()
+        start = getattr(seg, "start", None)
+        if text:
+            lines.append(f"[{format_mmss(start)}] {text}")
     return "\n".join(lines)
+
+
+def fetch_video_metadata(video_id: str) -> dict:
+    """
+    Use yt-dlp to fetch metadata without a YouTube API key.
+    Returns a dict with common fields.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        # Reduce noise; we only want info
+        "extract_flat": False,
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    # Normalize / cherry-pick the most useful fields for downstream ChatGPT context
+    meta = {
+        "webpage_url": info.get("webpage_url") or url,
+        "title": info.get("title"),
+        "description": info.get("description"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "channel_url": info.get("channel_url") or info.get("uploader_url"),
+        "uploader": info.get("uploader"),
+        "uploader_url": info.get("uploader_url"),
+        "upload_date": info.get("upload_date"),  # YYYYMMDD
+        "duration_seconds": info.get("duration"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
+        "tags": info.get("tags") or [],
+        "categories": info.get("categories") or [],
+        "language": info.get("language"),
+    }
+    return meta
+
+
+def format_metadata_block(meta: dict) -> str:
+    """
+    Create a human-readable header block to save with transcript.
+    """
+    def fmt_int(x):
+        return f"{x:,}" if isinstance(x, int) else (str(x) if x is not None else "")
+
+    def fmt_date(yyyymmdd: str | None) -> str:
+        if not yyyymmdd or len(yyyymmdd) != 8:
+            return yyyymmdd or ""
+        return f"{yyyymmdd[0:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+    duration = meta.get("duration_seconds")
+    duration_str = format_mmss(duration) if duration is not None else ""
+
+    tags = meta.get("tags") or []
+    cats = meta.get("categories") or []
+
+    # Keep this block “ChatGPT-friendly”: easy to parse, strong context up top
+    lines = [
+        "=== VIDEO METADATA ===",
+        f"URL: {meta.get('webpage_url', '')}",
+        f"Title: {meta.get('title', '')}",
+        f"Channel: {meta.get('channel', '')}",
+        f"Channel URL: {meta.get('channel_url', '')}",
+        f"Uploader: {meta.get('uploader', '')}",
+        f"Uploader URL: {meta.get('uploader_url', '')}",
+        f"Upload date: {fmt_date(meta.get('upload_date'))}",
+        f"Duration: {duration_str} ({meta.get('duration_seconds') or ''} seconds)",
+        f"Views: {fmt_int(meta.get('view_count'))}",
+        f"Likes: {fmt_int(meta.get('like_count'))}",
+        f"Comments: {fmt_int(meta.get('comment_count'))}",
+        f"Categories: {', '.join(cats) if cats else ''}",
+        f"Tags: {', '.join(tags) if tags else ''}",
+        f"Detected language: {meta.get('language', '')}",
+        "",
+        "=== VIDEO DESCRIPTION ===",
+        (meta.get("description") or "").strip(),
+        "",
+        "=== TRANSCRIPT (TIMESTAMPED) ===",
+    ]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("YouTube Transcript Extractor")
-        self.geometry("900x650")
-        self.minsize(720, 520)
+        self.title("YouTube Transcript Extractor (with Metadata + Timestamps)")
+        self.geometry("980x720")
+        self.minsize(780, 560)
 
         self.url_var = tk.StringVar()
-        self.lang_var = tk.StringVar(value="en")  # default; user can clear it
+        self.lang_var = tk.StringVar(value="en")  # user can clear to auto
+
+        self.status = tk.StringVar(value="Ready.")
+        self.current_meta: dict | None = None
 
         self._build_ui()
 
@@ -72,32 +196,32 @@ class App(tk.Tk):
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=pad, pady=(pad, 0))
+        top.columnconfigure(0, weight=1)
 
         ttk.Label(top, text="YouTube URL or Video ID:").grid(row=0, column=0, sticky="w")
         url_entry = ttk.Entry(top, textvariable=self.url_var)
-        url_entry.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        url_entry.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 0))
         url_entry.focus()
 
         ttk.Label(top, text="Language (optional, e.g. en). Clear to auto:").grid(row=2, column=0, sticky="w", pady=(10, 0))
         lang_entry = ttk.Entry(top, textvariable=self.lang_var, width=10)
         lang_entry.grid(row=3, column=0, sticky="w", pady=(4, 0))
 
-        self.fetch_btn = ttk.Button(top, text="Fetch Transcript", command=self.on_fetch)
+        self.fetch_btn = ttk.Button(top, text="Fetch", command=self.on_fetch)
         self.fetch_btn.grid(row=3, column=1, sticky="w", padx=(10, 0))
 
+        self.copy_btn = ttk.Button(top, text="Copy All", command=self.on_copy, state="disabled")
+        self.copy_btn.grid(row=3, column=2, sticky="w", padx=(10, 0))
+
         self.save_btn = ttk.Button(top, text="Save As…", command=self.on_save, state="disabled")
-        self.save_btn.grid(row=3, column=2, sticky="w", padx=(10, 0))
+        self.save_btn.grid(row=3, column=3, sticky="w", padx=(10, 0))
 
         self.clear_btn = ttk.Button(top, text="Clear", command=self.on_clear)
-        self.clear_btn.grid(row=3, column=3, sticky="w", padx=(10, 0))
+        self.clear_btn.grid(row=3, column=4, sticky="w", padx=(10, 0))
 
-        top.columnconfigure(0, weight=1)
-
-        self.status = tk.StringVar(value="Ready.")
         status_bar = ttk.Label(self, textvariable=self.status, anchor="w")
         status_bar.pack(fill="x", padx=pad, pady=(8, 0))
 
-        # Transcript box
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=pad, pady=pad)
 
@@ -111,17 +235,26 @@ class App(tk.Tk):
     def set_busy(self, busy: bool):
         self.fetch_btn.configure(state=("disabled" if busy else "normal"))
         self.clear_btn.configure(state=("disabled" if busy else "normal"))
-        # Save enabled only if transcript exists
-        if busy:
-            self.save_btn.configure(state="disabled")
-        else:
-            if self.text.get("1.0", "end-1c").strip():
-                self.save_btn.configure(state="normal")
+        self.copy_btn.configure(state=("disabled" if busy else ("normal" if self._has_content() else "disabled")))
+        self.save_btn.configure(state=("disabled" if busy else ("normal" if self._has_content() else "disabled")))
+
+    def _has_content(self) -> bool:
+        return bool(self.text.get("1.0", "end-1c").strip())
 
     def on_clear(self):
         self.text.delete("1.0", "end")
+        self.current_meta = None
+        self.copy_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
         self.status.set("Cleared.")
+
+    def on_copy(self):
+        content = self.text.get("1.0", "end-1c")
+        if not content.strip():
+            return
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.status.set("Copied to clipboard.")
 
     def on_fetch(self):
         url_or_id = self.url_var.get().strip()
@@ -134,45 +267,66 @@ class App(tk.Tk):
             return
 
         self.set_busy(True)
-        self.status.set("Fetching transcript…")
+        self.status.set("Fetching metadata + transcript…")
 
         def worker():
             try:
-                transcript = fetch_transcript_text(video_id, lang=lang)
-                if not transcript.strip():
+                # 1) metadata (helps interpret transcript later)
+                meta = fetch_video_metadata(video_id)
+
+                # 2) transcript segments -> timestamped text
+                segments = fetch_transcript_segments(video_id, lang=lang)
+                transcript_text = segments_to_timestamped_text(segments)
+
+                if not transcript_text.strip():
                     raise RuntimeError("Transcript fetched, but it was empty.")
-                self._ui_success(transcript)
+
+                full_output = format_metadata_block(meta) + transcript_text + "\n"
+                self._ui_success(full_output, meta)
             except Exception as e:
                 self._ui_error(e)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _ui_success(self, transcript: str):
+    def _ui_success(self, output: str, meta: dict):
         def run():
+            self.current_meta = meta
             self.text.delete("1.0", "end")
-            self.text.insert("1.0", transcript)
+            self.text.insert("1.0", output)
             self.status.set("Done.")
             self.set_busy(False)
+            self.copy_btn.configure(state="normal")
             self.save_btn.configure(state="normal")
+
         self.after(0, run)
 
     def _ui_error(self, err: Exception):
         def run():
             self.status.set("Error.")
             self.set_busy(False)
-            messagebox.showerror("Failed to fetch transcript", str(err))
+            messagebox.showerror("Failed", str(err))
+
         self.after(0, run)
 
     def on_save(self):
         content = self.text.get("1.0", "end-1c")
         if not content.strip():
-            messagebox.showinfo("Nothing to save", "Transcript box is empty.")
+            messagebox.showinfo("Nothing to save", "The output box is empty.")
             return
+
+        # Suggest a filename based on title if we have it
+        initial = "transcript.txt"
+        if self.current_meta and self.current_meta.get("title"):
+            safe = re.sub(r"[\\/:*?\"<>|]+", "", self.current_meta["title"]).strip()
+            safe = re.sub(r"\s+", " ", safe)[:80]
+            if safe:
+                initial = f"{safe}.txt"
 
         path = filedialog.asksaveasfilename(
             defaultextension=".txt",
+            initialfile=initial,
             filetypes=[("Text file", "*.txt"), ("All files", "*.*")],
-            title="Save transcript as…",
+            title="Save output as…",
         )
         if not path:
             return
@@ -184,7 +338,7 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    # nicer ttk look on Windows
+    # Nicer DPI handling on Windows (safe no-op elsewhere)
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
