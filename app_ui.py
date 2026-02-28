@@ -14,16 +14,16 @@ from tkinter import ttk, messagebox, filedialog
 from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
 
-# NEW: use ASS + word-timed captions (Whisper on clip only)
+# captions (ASS + word-timed)
 from captions import make_ass_from_clip_whisper, burn_in_ass
+
+# NEW: autocrop to 9:16 following largest face
+from autocrop import autocrop_to_9x16_face, AutoCropConfig
 
 
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 
 
-# -----------------------------
-# Helpers: ID + time parsing
-# -----------------------------
 def extract_video_id(url_or_id: str) -> str:
     s = (url_or_id or "").strip()
     if not s:
@@ -48,13 +48,6 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def parse_timestamp(ts: str) -> float:
-    """
-    Accepts:
-      - ss
-      - mm:ss
-      - hh:mm:ss
-    Returns seconds (float).
-    """
     s = (ts or "").strip()
     if not s:
         raise ValueError("Timestamp is empty.")
@@ -86,9 +79,6 @@ def format_mmss(seconds: float | None) -> str:
     return f"{mm:02d}:{ss:02d}"
 
 
-# -----------------------------
-# Fetch: transcript + metadata + comments
-# -----------------------------
 @dataclass
 class TranscriptSeg:
     start: float
@@ -101,10 +91,6 @@ class TranscriptSeg:
 
 
 def fetch_transcript_segments(video_id: str, lang: Optional[str] = None) -> List[TranscriptSeg]:
-    """
-    Uses youtube-transcript-api.
-    Returns a list of TranscriptSeg(start, duration, text).
-    """
     api = YouTubeTranscriptApi()
     if lang:
         items = api.fetch(video_id, languages=[lang])
@@ -122,10 +108,7 @@ def fetch_transcript_segments(video_id: str, lang: Optional[str] = None) -> List
 
 
 def segments_to_timestamped_text(segs: List[TranscriptSeg]) -> str:
-    lines = []
-    for s in segs:
-        lines.append(f"[{format_mmss(s.start)}] {s.text}")
-    return "\n".join(lines)
+    return "\n".join([f"[{format_mmss(s.start)}] {s.text}" for s in segs])
 
 
 def fetch_video_metadata(video_id: str, max_comments: int = 30) -> Dict[str, Any]:
@@ -162,7 +145,7 @@ def fetch_video_metadata(video_id: str, max_comments: int = 30) -> Dict[str, Any
             "like_count": c.get("like_count"),
         })
 
-    meta = {
+    return {
         "webpage_url": info.get("webpage_url") or url,
         "title": info.get("title"),
         "description": info.get("description"),
@@ -176,7 +159,6 @@ def fetch_video_metadata(video_id: str, max_comments: int = 30) -> Dict[str, Any
         "language": info.get("language"),
         "top_comments": comments,
     }
-    return meta
 
 
 def format_metadata_block(meta: Dict[str, Any]) -> str:
@@ -224,9 +206,6 @@ def format_metadata_block(meta: Dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-# -----------------------------
-# Video download + clip
-# -----------------------------
 def download_youtube(url: str, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(out_dir / "%(title).200s.%(ext)s")
@@ -240,23 +219,76 @@ def download_youtube(url: str, out_dir: Path) -> Path:
     }
 
     with YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=True)
 
-    mp4s = sorted(out_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not mp4s:
-        raise FileNotFoundError("Download finished but no .mp4 found.")
-    return mp4s[0]
+        # 1) Most reliable: yt-dlp gives you the final filename
+        final = info.get("_filename")
+        if final and Path(final).exists():
+            p = Path(final)
+            # sometimes _filename is pre-merge; ensure mp4 exists if merge_output_format used
+            if p.suffix.lower() == ".mp4" and p.exists():
+                return p
+
+        # 2) Sometimes yt-dlp uses requested_downloads list
+        rds = info.get("requested_downloads") or []
+        for d in rds:
+            fn = d.get("filepath") or d.get("_filename")
+            if fn and Path(fn).exists() and Path(fn).suffix.lower() == ".mp4":
+                return Path(fn)
+
+        # 3) Fallback: look for the *title-based* mp4 in out_dir (still better than newest)
+        title = (info.get("title") or "").strip()
+        if title:
+            # match by prefix
+            candidates = sorted(out_dir.glob(f"{title[:180]}*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                return candidates[0]
+
+    raise FileNotFoundError("Download finished but could not locate the merged .mp4 output.")
+
+
+def _ffprobe_duration(video_path: Path) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed:\n{p.stderr}")
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        raise RuntimeError(f"Could not parse duration from ffprobe output: {p.stdout!r}")
 
 
 def cut_clip(video_path: Path, start: float, end: float, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Re-encode for reliability (avoids keyframe/copy issues)
+    dur = _ffprobe_duration(video_path)
+
+    # clamp & validate
+    start = max(0.0, float(start))
+    end = float(end)
+
+    if end <= 0:
+        raise ValueError("End time must be > 0.")
+    if start >= dur:
+        raise ValueError(f"Start time ({start:.2f}) is >= video duration ({dur:.2f}).")
+    if end > dur:
+        end = dur
+    if end <= start:
+        raise ValueError(f"End time ({end:.2f}) must be > start time ({start:.2f}).")
+
+    clip_len = end - start
+
+    # Reliable: -ss AFTER -i, use -t duration
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start),
-        "-to", str(end),
         "-i", str(video_path),
+        "-ss", f"{start:.3f}",
+        "-t", f"{clip_len:.3f}",
         "-c:v", "libx264",
         "-crf", "18",
         "-preset", "veryfast",
@@ -265,23 +297,31 @@ def cut_clip(video_path: Path, start: float, end: float, out_path: Path) -> Path
         str(out_path),
     ]
     subprocess.run(cmd, check=True)
+
+    # sanity check
+    if not out_path.exists() or out_path.stat().st_size < 50_000:
+        raise RuntimeError(
+            f"Clip output looks empty/invalid: {out_path}\n"
+            f"Requested start={start:.2f}s end={end:.2f}s (len={clip_len:.2f}s), video dur={dur:.2f}s"
+        )
+
     return out_path
 
 
-# -----------------------------
-# UI App
-# -----------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("OpusLite UI (Transcript → Pick Timestamps → Clip + Captions)")
-        self.geometry("1100x780")
+        self.title("OpusLite UI (Transcript → Pick Timestamps → Clip + 9:16 + Captions)")
+        self.geometry("1100x820")
         self.minsize(900, 600)
 
         self.url_var = tk.StringVar()
-        self.lang_var = tk.StringVar(value="en")   # clear to auto
+        self.lang_var = tk.StringVar(value="en")
         self.start_var = tk.StringVar(value="00:30")
         self.end_var = tk.StringVar(value="01:15")
+
+        # NEW: checkbox
+        self.autocrop_var = tk.BooleanVar(value=True)
 
         self.status = tk.StringVar(value="Ready.")
         self.meta: Optional[Dict[str, Any]] = None
@@ -300,12 +340,8 @@ class App(tk.Tk):
         ttk.Label(top, text="YouTube URL or Video ID:").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.url_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-        ttk.Label(top, text="Language (optional, e.g. en). Clear to auto:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        ttk.Entry(top, textvariable=self.lang_var, width=10).grid(
-            row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0)
-        )
+        ttk.Label(top, text="Language (optional, e.g. en). Clear to auto:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(top, textvariable=self.lang_var, width=10).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
         btns = ttk.Frame(top)
         btns.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
@@ -328,7 +364,10 @@ class App(tk.Tk):
         ttk.Label(clipbar, text="Clip end:").pack(side="left", padx=(14, 0))
         ttk.Entry(clipbar, textvariable=self.end_var, width=12).pack(side="left", padx=(8, 0))
 
-        self.process_btn = ttk.Button(clipbar, text="2) Clip + Caption", command=self.on_process, state="disabled")
+        # NEW: checkbox for auto crop
+        ttk.Checkbutton(clipbar, text="Auto-crop to 9:16 (largest face)", variable=self.autocrop_var).pack(side="left", padx=(16, 0))
+
+        self.process_btn = ttk.Button(clipbar, text="2) Clip + 9:16 + Caption", command=self.on_process, state="disabled")
         self.process_btn.pack(side="left", padx=(14, 0))
 
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=pad, pady=(8, 0))
@@ -419,7 +458,7 @@ class App(tk.Tk):
             self.segs = segs
             self.text.delete("1.0", "end")
             self.text.insert("1.0", output)
-            self.status.set("Fetched. Paste into ChatGPT to choose timestamps, then click Clip + Caption.")
+            self.status.set("Fetched. Paste into ChatGPT to choose timestamps, then click Clip + 9:16 + Caption.")
             self.set_busy(False)
             self.copy_btn.configure(state="normal")
             self.save_btn.configure(state="normal")
@@ -448,9 +487,10 @@ class App(tk.Tk):
             return
 
         url = f"https://www.youtube.com/watch?v={self.video_id}"
+        do_autocrop = bool(self.autocrop_var.get())
 
         self.set_busy(True)
-        self.status.set("Downloading, clipping, generating word-timed captions (clip-only), and burning them in…")
+        self.status.set("Downloading, clipping, (optional) auto-cropping to 9:16, generating captions, and burning them in…")
 
         def worker():
             try:
@@ -467,10 +507,25 @@ class App(tk.Tk):
                 raw_clip = out_dir / f"clip_{int(clip_start)}_{int(clip_end)}_raw.mp4"
                 cut_clip(video_path, clip_start, clip_end, raw_clip)
 
-                # NEW: ASS captions (Whisper on clip only)
+                # Decide which video we caption
+                caption_base = raw_clip
+                vertical_clip = None
+
+                if do_autocrop:
+                    vertical_clip = out_dir / f"clip_{int(clip_start)}_{int(clip_end)}_vertical.mp4"
+                    cfg = AutoCropConfig(
+                        sample_fps=3.0,
+                        smoothing=0.85,
+                        deadzone_px=40,
+                        hold_no_face_sec=2.0,
+                    )
+                    autocrop_to_9x16_face(raw_clip, vertical_clip, cfg)
+                    caption_base = vertical_clip
+
+                # Captions on the final-framed video (raw or vertical)
                 ass_path = tmp_dir / "clip.ass"
                 make_ass_from_clip_whisper(
-                    raw_clip,
+                    caption_base,
                     ass_path,
                     model_size="small",
                     max_words_per_line=5,
@@ -478,19 +533,20 @@ class App(tk.Tk):
                     fontsize=64,
                 )
 
-                final_clip = out_dir / f"clip_{int(clip_start)}_{int(clip_end)}_captioned.mp4"
-                burn_in_ass(raw_clip, ass_path, final_clip)
+                final_clip = out_dir / f"clip_{int(clip_start)}_{int(clip_end)}_{'vertical_' if do_autocrop else ''}captioned.mp4"
+                burn_in_ass(caption_base, ass_path, final_clip)
 
-                self._ui_success_process(final_clip)
+                self._ui_success_process(final_clip, vertical_clip)
             except Exception as e:
                 self._ui_error(e)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _ui_success_process(self, final_clip: Path):
+    def _ui_success_process(self, final_clip: Path, vertical_clip: Optional[Path]):
         def run():
             self.set_busy(False)
-            msg = f"Done.\n\nSaved:\n{final_clip}\n\nCaptions: Whisper word-timestamps (clip-only) → ASS (1 line, max 5 words)"
+            extras = f"\n\nVertical:\n{vertical_clip}" if vertical_clip else ""
+            msg = f"Done.\n\nSaved:\n{final_clip}{extras}\n\nCaptions: Whisper word-timestamps (clip-only) → ASS (1 line, max 5 words)"
             self.status.set("Done.")
             messagebox.showinfo("Success", msg)
         self.after(0, run)
